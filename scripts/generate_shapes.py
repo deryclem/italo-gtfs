@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OSM_PBF = REPO_ROOT / "data" / "italo-rail.osm.pbf"
+DEFAULT_OSM_PBF = REPO_ROOT / "data" / "italo-network.osm.pbf"
 DEFAULT_CFG = REPO_ROOT / "scripts" / "pfaedle.cfg"
 
 
@@ -129,7 +129,7 @@ def generate_shapes(
             pfaedle_bin,
             "-c", str(cfg_path),
             "-x", str(osm_pbf),
-            "-m", "rail",
+            "-m", "rail,bus",
             "-D",  # Drop existing and recalculate
             "-F",  # Preserve non-standard / extra GTFS fields
             "-o", str(out_path),
@@ -141,7 +141,7 @@ def generate_shapes(
             return False
 
         # Copy generated shapes and updated tables back to gtfs_dir
-        updated_files = ["shapes.txt", "trips.txt", "stop_times.txt", "attributions.txt"]
+        updated_files = ["shapes.txt", "trips.txt", "stop_times.txt", "attributions.txt", "transfers.txt"]
         for fname in updated_files:
             src = out_path / fname
             if src.exists():

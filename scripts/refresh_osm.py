@@ -14,7 +14,7 @@ from pathlib import Path
 import urllib.request
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TARGET_PBF = REPO_ROOT / "data" / "italo-rail.osm.pbf"
+TARGET_PBF = REPO_ROOT / "data" / "italo-network.osm.pbf"
 CFG_FILE = REPO_ROOT / "scripts" / "pfaedle.cfg"
 GTFS_ZIP = REPO_ROOT / "gtfs-italo.zip"
 GEOFABRIK_URL = "https://download.geofabrik.de/europe/italy-latest.osm.pbf"
@@ -32,13 +32,13 @@ def refresh_osm() -> None:
         print(f"✅ Downloaded ({tmp_pbf.stat().st_size / 1024 / 1024:.1f} MB)")
 
         TARGET_PBF.parent.mkdir(parents=True, exist_ok=True)
-        print(f"🚆 Filtering rail network for Italo to {TARGET_PBF}...")
+        print(f"🚆 Filtering rail and bus network for Italo to {TARGET_PBF}...")
         cmd = [
             pfaedle_bin,
             "-c", str(CFG_FILE),
             "-x", str(tmp_pbf),
             "-X", str(TARGET_PBF),
-            "-m", "rail",
+            "-m", "rail,bus",
             str(GTFS_ZIP),
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)

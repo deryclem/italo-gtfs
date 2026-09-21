@@ -37,14 +37,14 @@ jobs:
           make -j$(nproc)
           sudo make install
 
-      - name: Refresh OSM rail data
+      - name: Refresh OSM network data
         run: python3 scripts/refresh_osm.py
 
       - name: Commit updated OSM data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/italo-rail.osm.pbf
-          git diff --cached --quiet || git commit -m "chore: refresh OSM rail network $(date +'%Y-%m-%d')"
+          git add data/italo-network.osm.pbf
+          git diff --cached --quiet || git commit -m "chore: refresh OSM network $(date +'%Y-%m-%d')"
           git pull --rebase origin main
           git push

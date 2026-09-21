@@ -65,6 +65,33 @@ AGENCY_EMAIL = "italo@pec.ntvspa.it"
 ROUTE_COLOR = "E30037"       # Official Italo Ruby Red
 ROUTE_TEXT_COLOR = "FFFFFF"  # High-contrast white text
 
+# Pure ItaloBus stop IDs
+PURE_BUS_STOP_IDS = {
+    "IT::ScheduledStopPoint:CDZ",
+    "IT::ScheduledStopPoint:CON",
+    "IT::ScheduledStopPoint:ERL",
+    "IT::ScheduledStopPoint:LGZ",
+    "IT::ScheduledStopPoint:LUX",
+    "IT::ScheduledStopPoint:MBS",
+    "IT::ScheduledStopPoint:NPB",
+    "IT::ScheduledStopPoint:PEY",
+    "IT::ScheduledStopPoint:PNE",
+    "IT::ScheduledStopPoint:SDX",
+    "IT::ScheduledStopPoint:SOT",
+    "IT::ScheduledStopPoint:TDX",
+    "IT::ScheduledStopPoint:TRX",
+    "IT::ScheduledStopPoint:UDN",
+    "IT::ScheduledStopPoint:XTG",
+}
+
+# Major junction stations connecting rail and bus
+JUNCTION_HUBS = [
+    "IT::ScheduledStopPoint:NAC",
+    "IT::ScheduledStopPoint:NAF",
+    "IT::ScheduledStopPoint:VEM",
+    "IT::ScheduledStopPoint:SMN",
+]
+
 STALE_STATE_FILE = Path(".last_publication_timestamp")
 
 
@@ -120,8 +147,13 @@ def read_publication_timestamp_and_operator(netex_gz: Path) -> tuple[str, bool]:
 def check_freshness(publication_timestamp: str) -> None:
     if STALE_STATE_FILE.exists():
         last_timestamp = STALE_STATE_FILE.read_text().strip()
-        if last_timestamp == publication_timestamp:
-            print(f"Warning: PublicationTimestamp unchanged since last run ({publication_timestamp})")
+        if last_timestamp != publication_timestamp:
+            print(f"PublicationTimestamp changed: {last_timestamp} -> {publication_timestamp}. Invalidating cache.")
+            raw_zip = WORK_DIR / "gtfs_raw.zip"
+            if raw_zip.exists():
+                raw_zip.unlink()
+        else:
+            print(f"PublicationTimestamp unchanged ({publication_timestamp})")
 
 
 # ── Metadata Streaming Extraction ─────────────────────────────────────────────
@@ -251,6 +283,12 @@ def convert_to_gtfs(netex_gz: Path) -> Path:
 
 # ── Post-processing & Enrichments ─────────────────────────────────────────────
 
+def time_to_sec(t: str) -> int:
+    """Converts HH:MM:SS string to total seconds."""
+    parts = list(map(int, t.split(":")))
+    return parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
 def clean_station_name(name: str) -> str:
     """
     Strips trailing English annotations from station names:
@@ -302,7 +340,7 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
     # 2. stops.txt
     stops_path = extract_dir / "stops.txt"
     stops_map: dict[str, str] = {}
-    bus_stop_ids: set[str] = set()
+    bus_parent_ids: set[str] = set()
 
     with open(stops_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -312,23 +350,18 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
     if "wheelchair_boarding" not in fieldnames:
         fieldnames.append("wheelchair_boarding")
 
-    # Pass 1: Collect child codes and detect bus stops
     for row in stop_rows:
         raw_name = row.get("stop_name", "")
         cleaned = clean_station_name(raw_name)
         row["stop_name"] = cleaned
         stops_map[row["stop_id"]] = cleaned
+        if row["stop_id"] in PURE_BUS_STOP_IDS and row.get("parent_station"):
+            bus_parent_ids.add(row["parent_station"])
 
-        if "BUS" in raw_name or "BUS" in row["stop_id"]:
-            bus_stop_ids.add(row["stop_id"])
-            if row.get("parent_station"):
-                bus_stop_ids.add(row["parent_station"])
-
-    # Pass 2: Fill stop_code and wheelchair_boarding
     for row in stop_rows:
         stop_id = row["stop_id"]
         loc_type = row.get("location_type", "0")
-        is_bus = stop_id in bus_stop_ids or row.get("parent_station") in bus_stop_ids
+        is_bus = stop_id in PURE_BUS_STOP_IDS or stop_id in bus_parent_ids or row.get("parent_station") in PURE_BUS_STOP_IDS
 
         # Set wheelchair accessibility: 1 for AV train stations, 0 for bus stops
         row["wheelchair_boarding"] = "0" if is_bus else "1"
@@ -342,41 +375,213 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
         writer.writeheader()
         writer.writerows(stop_rows)
 
-    # 3. stop_times.txt (CRITICAL: sort chronologically to fix string-sorted XML IDs)
+    # 3. Decouple composite multimodal trips (Option A) and build GTFS tables
     st_path = extract_dir / "stop_times.txt"
     with open(st_path, newline="", encoding="utf-8") as f:
         st_rows = list(csv.DictReader(f))
 
     trip_stop_times = defaultdict(list)
-    trip_is_bus: set[str] = set()
-    trip_destinations: dict[str, str] = {}
-
     for row in st_rows:
         trip_stop_times[row["trip_id"]].append(row)
-        if row["stop_id"] in bus_stop_ids:
-            trip_is_bus.add(row["trip_id"])
 
-    fixed_st_rows = []
-    for trip_id, stops in trip_stop_times.items():
+    trips_path = extract_dir / "trips.txt"
+    with open(trips_path, newline="", encoding="utf-8") as f:
+        orig_trip_rows = list(csv.DictReader(f))
+        trips_by_id = {r["trip_id"]: r for r in orig_trip_rows}
+
+    routes_path = extract_dir / "routes.txt"
+    with open(routes_path, newline="", encoding="utf-8") as f:
+        orig_route_rows = list(csv.DictReader(f))
+        routes_by_id = {r["route_id"]: r for r in orig_route_rows}
+
+    new_trips = []
+    new_st_rows = []
+    new_routes: dict[str, dict[str, str]] = {}
+    transfers_rows: list[dict[str, str]] = []
+
+    for tid, st_list in trip_stop_times.items():
         # Sort chronologically by arrival or departure time
-        sorted_stops = sorted(stops, key=lambda x: x["arrival_time"] or x["departure_time"])
-        total = len(sorted_stops)
+        sorted_stops = sorted(st_list, key=lambda x: x["arrival_time"] or x["departure_time"])
+        orig_trip = trips_by_id[tid]
+        orig_route_id = orig_trip["route_id"]
 
-        for seq, row in enumerate(sorted_stops, start=1):
-            row["stop_sequence"] = str(seq)
-            row["timepoint"] = "1"
+        has_bus = any(s["stop_id"] in PURE_BUS_STOP_IDS for s in sorted_stops)
+        has_rail = any(s["stop_id"] not in PURE_BUS_STOP_IDS for s in sorted_stops)
 
-            # Commercial restrictions: no alighting at origin, no boarding at terminus
-            if seq == 1:
-                row["drop_off_type"] = "1"
-            elif seq == total:
-                row["pickup_type"] = "1"
+        # Pure rail trip
+        if not (has_bus and has_rail):
+            total_s = len(sorted_stops)
+            for seq, s in enumerate(sorted_stops, start=1):
+                s["stop_sequence"] = str(seq)
+                s["timepoint"] = "1"
+                if seq == 1:
+                    s["drop_off_type"] = "1"
+                    s["pickup_type"] = "0"
+                elif seq == total_s:
+                    s["pickup_type"] = "1"
+                    s["drop_off_type"] = "0"
+                else:
+                    s["pickup_type"] = "0"
+                    s["drop_off_type"] = "0"
+                new_st_rows.append(s)
 
-            fixed_st_rows.append(row)
+            if orig_route_id not in new_routes:
+                new_routes[orig_route_id] = {
+                    "route_id": orig_route_id,
+                    "agency_id": AGENCY_ID,
+                    "route_short_name": "Italo",
+                    "route_long_name": "Italo AV (Alta Velocità)",
+                    "route_desc": "",
+                    "route_type": "2",
+                    "route_url": "",
+                    "route_color": ROUTE_COLOR,
+                    "route_text_color": ROUTE_TEXT_COLOR,
+                    "route_sort_order": "",
+                    "continuous_pickup": "",
+                    "continuous_drop_off": "",
+                    "network_id": "",
+                }
 
-        last_stop_id = sorted_stops[-1]["stop_id"]
-        trip_destinations[trip_id] = stops_map.get(last_stop_id, "")
+            trip_row = dict(orig_trip)
+            trip_row["trip_short_name"] = metadata.train_numbers.get(tid, extract_train_number(tid))
+            trip_row["trip_headsign"] = stops_map.get(sorted_stops[-1]["stop_id"], "")
+            trip_row["wheelchair_accessible"] = "1"
+            trip_row["bikes_allowed"] = "1"
+            new_trips.append(trip_row)
+            continue
 
+        # Composite trip (Train + Shuttle Bus) -> Split at junction station(s)
+        types = ["BUS" if s["stop_id"] in PURE_BUS_STOP_IDS else "RAIL" for s in sorted_stops]
+        transitions = [i for i in range(len(types) - 1) if types[i] != types[i + 1]]
+
+        leg_defs: list[tuple[str, list[dict[str, str]]]] = []
+        if len(transitions) == 1:
+            idx = transitions[0]
+            if types[idx] == "RAIL":
+                # Rail -> Bus (junction is idx, the rail station)
+                leg_defs.append(("RAIL", sorted_stops[0 : idx + 1]))
+                leg_defs.append(("BUS", sorted_stops[idx : ]))
+            else:
+                # Bus -> Rail (junction is idx + 1, the rail station)
+                leg_defs.append(("BUS", sorted_stops[0 : idx + 2]))
+                leg_defs.append(("RAIL", sorted_stops[idx + 1 : ]))
+        elif len(transitions) == 2:
+            # Bus -> Rail -> Bus (2 junction stations)
+            idx1, idx2 = transitions
+            leg_defs.append(("BUS", sorted_stops[0 : idx1 + 2]))
+            leg_defs.append(("RAIL", sorted_stops[idx1 + 1 : idx2 + 1]))
+            leg_defs.append(("BUS", sorted_stops[idx2 : ]))
+        else:
+            # Fallback for unexpected transitions: treat as rail
+            leg_defs.append(("RAIL", sorted_stops))
+
+        # Parse commercial train / bus numbers
+        raw_id = tid.split(":")[-1]
+        m = re.match(r"^(\d+)(?:-(\d+))?", raw_id)
+        p1 = m.group(1) if m else raw_id
+        p2 = m.group(2) if m and m.group(2) and int(m.group(2)) > 10 else None
+
+        created_legs: list[tuple[str, str, list[dict[str, str]]]] = []
+        for leg_idx, (mode, leg_stops) in enumerate(leg_defs, start=1):
+            suffix = f"_{mode.lower()}" if len(leg_defs) == 2 else f"_{mode.lower()}{leg_idx}"
+            leg_tid = f"{tid}{suffix}"
+            leg_rid = f"{orig_route_id}-{mode}"
+
+            if leg_rid not in new_routes:
+                new_routes[leg_rid] = {
+                    "route_id": leg_rid,
+                    "agency_id": AGENCY_ID,
+                    "route_short_name": "ItaloBus" if mode == "BUS" else "Italo",
+                    "route_long_name": "ItaloBus (Collegamento)" if mode == "BUS" else "Italo AV (Alta Velocità)",
+                    "route_desc": "",
+                    "route_type": "3" if mode == "BUS" else "2",
+                    "route_url": "",
+                    "route_color": ROUTE_COLOR,
+                    "route_text_color": ROUTE_TEXT_COLOR,
+                    "route_sort_order": "",
+                    "continuous_pickup": "",
+                    "continuous_drop_off": "",
+                    "network_id": "",
+                }
+
+            if len(leg_defs) == 2:
+                if leg_defs[0][0] == "RAIL":
+                    leg_num = p1 if mode == "RAIL" else (p2 or p1)
+                else:
+                    leg_num = p1 if mode == "BUS" else (p2 or p1)
+            else:
+                leg_num = p1
+
+            leg_dest = stops_map.get(leg_stops[-1]["stop_id"], "")
+
+            leg_trip_row = dict(orig_trip)
+            leg_trip_row["trip_id"] = leg_tid
+            leg_trip_row["route_id"] = leg_rid
+            leg_trip_row["trip_short_name"] = leg_num
+            leg_trip_row["trip_headsign"] = leg_dest
+            leg_trip_row["wheelchair_accessible"] = "0" if mode == "BUS" else "1"
+            leg_trip_row["bikes_allowed"] = "0" if mode == "BUS" else "1"
+            new_trips.append(leg_trip_row)
+            created_legs.append((mode, leg_tid, leg_stops))
+
+            total_s = len(leg_stops)
+            for seq, s in enumerate(leg_stops, start=1):
+                st_row = dict(s)
+                st_row["trip_id"] = leg_tid
+                st_row["stop_sequence"] = str(seq)
+                st_row["timepoint"] = "1"
+
+                # Terminus of intermediate leg (at junction):
+                if seq == total_s and leg_idx < len(leg_defs):
+                    st_row["departure_time"] = st_row["arrival_time"]
+                    st_row["pickup_type"] = "1"
+                    st_row["drop_off_type"] = "0"
+                # Origin of subsequent leg (at junction):
+                elif seq == 1 and leg_idx > 1:
+                    st_row["arrival_time"] = st_row["departure_time"]
+                    st_row["drop_off_type"] = "1"
+                    st_row["pickup_type"] = "0"
+                elif seq == 1:
+                    st_row["drop_off_type"] = "1"
+                    st_row["pickup_type"] = "0"
+                elif seq == total_s:
+                    st_row["pickup_type"] = "1"
+                    st_row["drop_off_type"] = "0"
+                else:
+                    st_row["pickup_type"] = "0"
+                    st_row["drop_off_type"] = "0"
+
+                new_st_rows.append(st_row)
+
+        # Transfers between consecutive legs at the junction
+        for l_i in range(len(created_legs) - 1):
+            _m1, t1, s1 = created_legs[l_i]
+            _m2, t2, s2 = created_legs[l_i + 1]
+            j_stop = s1[-1]["stop_id"]
+            arr_sec = time_to_sec(s1[-1]["arrival_time"])
+            dep_sec = time_to_sec(s2[0]["departure_time"])
+            layover = max(0, dep_sec - arr_sec)
+            transfers_rows.append({
+                "from_stop_id": j_stop,
+                "to_stop_id": j_stop,
+                "from_trip_id": t1,
+                "to_trip_id": t2,
+                "transfer_type": "2",
+                "min_transfer_time": str(layover),
+            })
+
+    # Station-level walking transfers for major junction hubs
+    for hub in JUNCTION_HUBS:
+        transfers_rows.append({
+            "from_stop_id": hub,
+            "to_stop_id": hub,
+            "from_trip_id": "",
+            "to_trip_id": "",
+            "transfer_type": "2",
+            "min_transfer_time": "300",
+        })
+
+    # Write stop_times.txt
     with open(st_path, "w", newline="", encoding="utf-8") as f:
         st_fieldnames = [
             "trip_id",
@@ -394,67 +599,54 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
         ]
         writer = csv.DictWriter(f, fieldnames=st_fieldnames)
         writer.writeheader()
-        writer.writerows(fixed_st_rows)
+        writer.writerows(new_st_rows)
 
-    # 4. routes.txt
-    routes_path = extract_dir / "routes.txt"
-    with open(routes_path, newline="", encoding="utf-8") as f:
-        route_rows = list(csv.DictReader(f))
-        r_fields = list(route_rows[0].keys()) if route_rows else []
-
-    # Map each route to bus vs high-speed rail based on trips
-    trip_to_route = {}
-    trips_path = extract_dir / "trips.txt"
-    with open(trips_path, newline="", encoding="utf-8") as f:
-        trip_rows = list(csv.DictReader(f))
-        for row in trip_rows:
-            trip_to_route[row["trip_id"]] = row["route_id"]
-
-    bus_routes: set[str] = set()
-    for tid in trip_is_bus:
-        if tid in trip_to_route:
-            bus_routes.add(trip_to_route[tid])
-
-    for r in route_rows:
-        r_id = r["route_id"]
-        is_bus_route = r_id in bus_routes
-
-        r["agency_id"] = AGENCY_ID
-        r["route_type"] = "3" if is_bus_route else "2"
-        r["route_short_name"] = "ItaloBus" if is_bus_route else "Italo"
-        r["route_long_name"] = "ItaloBus (Collegamento)" if is_bus_route else "Italo AV (Alta Velocità)"
-        r["route_color"] = ROUTE_COLOR
-        r["route_text_color"] = ROUTE_TEXT_COLOR
-
+    # Write routes.txt
+    routes_fieldnames = [
+        "route_id",
+        "agency_id",
+        "route_short_name",
+        "route_long_name",
+        "route_desc",
+        "route_type",
+        "route_url",
+        "route_color",
+        "route_text_color",
+        "route_sort_order",
+        "continuous_pickup",
+        "continuous_drop_off",
+        "network_id",
+    ]
     with open(routes_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=r_fields)
+        writer = csv.DictWriter(f, fieldnames=routes_fieldnames)
         writer.writeheader()
-        writer.writerows(route_rows)
+        writer.writerows(new_routes.values())
 
-    # 5. trips.txt
-    t_fields = list(trip_rows[0].keys()) if trip_rows else []
+    # Write trips.txt
+    t_fields = list(new_trips[0].keys())
     for extra in ("trip_headsign", "trip_short_name", "wheelchair_accessible", "bikes_allowed"):
         if extra not in t_fields:
             t_fields.append(extra)
 
-    for r in trip_rows:
-        tid = r["trip_id"]
-        is_bus = tid in trip_is_bus
-
-        # Train / Bus Number
-        r["trip_short_name"] = metadata.train_numbers.get(tid, extract_train_number(tid))
-
-        # Headsign from destination stop
-        r["trip_headsign"] = trip_destinations.get(tid, "")
-
-        # Accessibility
-        r["wheelchair_accessible"] = "0" if is_bus else "1"
-        r["bikes_allowed"] = "0" if is_bus else "1"
-
     with open(trips_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=t_fields)
         writer.writeheader()
-        writer.writerows(trip_rows)
+        writer.writerows(new_trips)
+
+    # Write transfers.txt
+    transfers_path = extract_dir / "transfers.txt"
+    with open(transfers_path, "w", newline="", encoding="utf-8") as f:
+        transfers_fields = [
+            "from_stop_id",
+            "to_stop_id",
+            "from_trip_id",
+            "to_trip_id",
+            "transfer_type",
+            "min_transfer_time",
+        ]
+        writer = csv.DictWriter(f, fieldnames=transfers_fields)
+        writer.writeheader()
+        writer.writerows(transfers_rows)
 
     # 6. calendar.txt & calendar_dates.txt
     cal_path = extract_dir / "calendar.txt"
@@ -603,6 +795,7 @@ def sanity_check(gtfs_zip: Path) -> None:
             "calendar.txt",
             "calendar_dates.txt",
             "feed_info.txt",
+            "transfers.txt",
         }
         missing = required - names
         if missing:
@@ -616,6 +809,23 @@ def sanity_check(gtfs_zip: Path) -> None:
             ]
             if parent_without_code:
                 sys.exit(f"{len(parent_without_code)} parent stations are missing stop_code")
+
+        with zf.open("trips.txt") as f:
+            trips = list(csv.DictReader(line.decode("utf-8") for line in f))
+            trip_ids = {row["trip_id"] for row in trips}
+            trips_with_shapes = [row["trip_id"] for row in trips if row.get("shape_id")]
+
+        with zf.open("transfers.txt") as f:
+            transfers = list(csv.DictReader(line.decode("utf-8") for line in f))
+            for tr in transfers:
+                if tr["from_stop_id"] not in stop_ids:
+                    sys.exit(f"transfers.txt from_stop_id {tr['from_stop_id']} missing in stops.txt")
+                if tr["to_stop_id"] not in stop_ids:
+                    sys.exit(f"transfers.txt to_stop_id {tr['to_stop_id']} missing in stops.txt")
+                if tr.get("from_trip_id") and tr["from_trip_id"] not in trip_ids:
+                    sys.exit(f"transfers.txt from_trip_id {tr['from_trip_id']} missing in trips.txt")
+                if tr.get("to_trip_id") and tr["to_trip_id"] not in trip_ids:
+                    sys.exit(f"transfers.txt to_trip_id {tr['to_trip_id']} missing in trips.txt")
 
         with zf.open("stop_times.txt") as f:
             st = list(csv.DictReader(line.decode("utf-8") for line in f))
@@ -653,6 +863,9 @@ def sanity_check(gtfs_zip: Path) -> None:
             if len(cal_dates) == 0:
                 sys.exit("calendar_dates.txt is unexpectedly empty")
 
+        if "shapes.txt" in names:
+            print(f"Shapes coverage: {len(trips_with_shapes):,} / {len(trips):,} trips ({len(trips_with_shapes)/len(trips)*100:.1f}%)")
+
     print("All sanity checks passed successfully! (0 errors)")
 
 
@@ -683,7 +896,10 @@ def main() -> None:
     sanity_check(OUTPUT_ZIP)
 
     STALE_STATE_FILE.write_text(publication_timestamp)
-    shutil.rmtree(WORK_DIR, ignore_errors=True)
+    # Clean up heavy temporary databases and extracted files, keep raw zip for fast re-runs
+    for stale in (NETEX_DB, GTFS_DB, WORK_DIR / "gtfs_extracted"):
+        if stale.exists():
+            shutil.rmtree(stale, ignore_errors=True)
     print(f"\nSuccessfully generated {OUTPUT_ZIP} (PublicationTimestamp: {publication_timestamp})")
 
 
