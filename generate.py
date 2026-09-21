@@ -570,7 +570,14 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
             "https://github.com/deryclem/italo-gtfs",
         ])
 
-    # 9. Package final GTFS zip
+    # 9. Generate shapes via pfaedle (if available)
+    try:
+        from scripts.generate_shapes import generate_shapes
+        generate_shapes(extract_dir)
+    except Exception as e:
+        print(f"⚠️  Could not generate shapes: {e}")
+
+    # 10. Package final GTFS zip
     if OUTPUT_ZIP.exists():
         OUTPUT_ZIP.unlink()
 

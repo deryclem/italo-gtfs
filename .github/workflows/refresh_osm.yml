@@ -1,12 +1,12 @@
-name: Generate GTFS
+name: Refresh OSM Tracks
 
 on:
   schedule:
-    - cron: "0 4 * * 1"  # Every Monday at 04:00 UTC
-  workflow_dispatch:       # Also allows manual trigger from the GitHub UI
+    - cron: "0 2 1 * *"  # On the 1st of every month at 02:00 UTC
+  workflow_dispatch:       # Allows manual trigger anytime
 
 jobs:
-  generate:
+  refresh:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,11 +17,6 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           submodules: recursive
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
 
       - name: Cache pfaedle binary
         id: cache-pfaedle
@@ -42,21 +37,14 @@ jobs:
           make -j$(nproc)
           sudo make install
 
-      - name: Set up badger
-        working-directory: vendor/badger
-        run: |
-          uv venv --python 3.12
-          uv sync
-          sh scripts/generate-schema.sh
+      - name: Refresh OSM rail data
+        run: python3 scripts/refresh_osm.py
 
-      - name: Generate GTFS feed
-        run: uv run --python 3.12 --with-requirements requirements.txt python3 generate.py
-
-      - name: Commit updated feed
+      - name: Commit updated OSM data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add gtfs-italo.zip .last_publication_timestamp
-          git diff --cached --quiet || git commit -m "chore: update GTFS feed $(date +'%Y-%m-%d')"
+          git add data/italo-rail.osm.pbf
+          git diff --cached --quiet || git commit -m "chore: refresh OSM rail network $(date +'%Y-%m-%d')"
           git pull --rebase origin main
           git push
