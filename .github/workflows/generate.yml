@@ -42,6 +42,23 @@ jobs:
           make -j$(nproc)
           sudo make install
 
+      - name: Cache gtfstidy binary
+        id: cache-gtfstidy
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin/gtfstidy
+          key: gtfstidy-bin-v1
+
+      - name: Set up Go
+        if: steps.cache-gtfstidy.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Install gtfstidy
+        if: steps.cache-gtfstidy.outputs.cache-hit != 'true'
+        run: go install github.com/patrickbr/gtfstidy@latest
+
       - name: Set up badger
         working-directory: vendor/badger
         run: |

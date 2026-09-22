@@ -13,6 +13,9 @@ Usage:
 
 import csv
 import gzip
+import hashlib
+import math
+import os
 import re
 import shutil
 import subprocess
@@ -65,24 +68,91 @@ AGENCY_EMAIL = "italo@pec.ntvspa.it"
 ROUTE_COLOR = "E30037"       # Official Italo Ruby Red
 ROUTE_TEXT_COLOR = "FFFFFF"  # High-contrast white text
 
-# Pure ItaloBus stop IDs
-PURE_BUS_STOP_IDS = {
-    "IT::ScheduledStopPoint:CDZ",
-    "IT::ScheduledStopPoint:CON",
-    "IT::ScheduledStopPoint:ERL",
-    "IT::ScheduledStopPoint:LGZ",
-    "IT::ScheduledStopPoint:LUX",
-    "IT::ScheduledStopPoint:MBS",
-    "IT::ScheduledStopPoint:NPB",
-    "IT::ScheduledStopPoint:PEY",
-    "IT::ScheduledStopPoint:PNE",
-    "IT::ScheduledStopPoint:SDX",
-    "IT::ScheduledStopPoint:SOT",
-    "IT::ScheduledStopPoint:TDX",
-    "IT::ScheduledStopPoint:TRX",
-    "IT::ScheduledStopPoint:UDN",
-    "IT::ScheduledStopPoint:XTG",
+
+def build_route_id(mode: str, stop_ids: list[str]) -> str:
+    """
+    Builds a route_id from the itinerary instead of the commercial train number.
+
+    The source NeTEx numbers every departure separately, so deriving route_id from
+    it yields one route per trip (2462 routes for 2464 trips). GTFS expects a route
+    to be the commercial line, with its departures as trips.
+
+    Origin and destination codes keep the id readable; the digest of the full stop
+    sequence separates itineraries sharing them (Napoli Centrale -> Milano Centrale
+    has 10 distinct variants, e.g. via Roma Termini or via Napoli Afragola).
+    """
+    short = [sid.split(":")[-1] for sid in stop_ids]
+    digest = hashlib.sha1("|".join(stop_ids).encode("utf-8")).hexdigest()[:6]
+    return f"IT::Line:{mode}-{short[0]}-{short[-1]}-{digest}"
+
+# A stop where the vehicle waits longer than this is a connection, not a dwell.
+# Italo's booking site shows "Change" for an 87 min wait at Bologna (6143/8918)
+# and nothing for the 2 min one at Verona (9908/8981), so the line sits between.
+MAX_DWELL_SECONDS = 20 * 60
+
+
+def split_on_layovers(leg_defs: list[tuple[str, list[dict[str, str]]]]) -> list[tuple[str, list[dict[str, str]]]]:
+    """
+    Splits a leg wherever the vehicle sits at a stop past MAX_DWELL_SECONDS.
+
+    The source packs a whole itinerary into one journey, so a train change shows
+    up as a very long stop: Reggio Calabria to Udine waits 3h25 at Roma Termini,
+    which Italo sells as trains 8134 then 8920. Left alone it reads as one train
+    that simply parks, and riders are never told to change.
+    """
+    out: list[tuple[str, list[dict[str, str]]]] = []
+    for mode, stops_of_leg in leg_defs:
+        start = 0
+        for i, stop in enumerate(stops_of_leg[1:-1], start=1):
+            dwell = time_to_sec(stop["departure_time"]) - time_to_sec(stop["arrival_time"])
+            if dwell > MAX_DWELL_SECONDS:
+                # The junction stop ends one leg and starts the next.
+                out.append((mode, stops_of_leg[start : i + 1]))
+                start = i
+        out.append((mode, stops_of_leg[start:]))
+    return out
+
+
+# Coach-only stops that the source does not suffix with "BUS".
+# Everything else is detected from the stop name (see collect_bus_stop_ids).
+# Udine, Pordenone, Conegliano and Treviso were listed here previously: they sit
+# on the Udine-Venezia railway and Italo sells them as trains (8907, 8993), so
+# treating them as coach stops split those trips in half.
+EXTRA_BUS_STOP_IDS = {
+    "IT::ScheduledStopPoint:SOT",  # Sorrento — no Italo station, coach only
+    "IT::ScheduledStopPoint:LGZ",  # Longarone-Zoldo — on the Cortina coach line
 }
+
+# Stops the source suffixes with "BUS" although they are railway stations.
+# Italo's own booking site calls TRX "Treviso Centrale" and sells trains 8907,
+# 8920 and 8993 straight through it, so the suffix is a source error.
+MISLABELLED_BUS_STOP_IDS = {
+    "IT::ScheduledStopPoint:TRX": "Treviso Centrale",
+    "IT::StopPlace:TRX": "Treviso Centrale",
+}
+
+# Fastest plausible average speed for a coach leg, stops included (km/h).
+# Rail legs run at 65+ km/h, real ItaloBus legs peak at 45, so anything above
+# this means a train was mistakenly split into a coach leg.
+MAX_COACH_SPEED_KMH = 55.0
+
+
+def collect_bus_stop_ids(stop_rows: list[dict[str, str]]) -> set[str]:
+    """
+    Collects coach-only stops, which the NeTEx feed does not model as such: it
+    declares <TransportMode>rail</TransportMode> for every journey, coaches
+    included. The only marker left is the stop name, which Italo suffixes with
+    "BUS" ("Cortina D'Ampezzo BUS"), as its own booking site displays it.
+
+    Deriving the set from the feed keeps new coach destinations working without
+    touching this file; EXTRA_BUS_STOP_IDS covers the stops Italo leaves unmarked.
+    """
+    found = {
+        row["stop_id"]
+        for row in stop_rows
+        if row.get("stop_name", "").upper().endswith(" BUS")
+    }
+    return (found | EXTRA_BUS_STOP_IDS) - set(MISLABELLED_BUS_STOP_IDS)
 
 # Major junction stations connecting rail and bus
 JUNCTION_HUBS = [
@@ -166,22 +236,28 @@ class ItaloMetadata:
     stopplace_codes: dict[str, str]                # stop_id -> 3-letter station code (e.g. "MC_", "TOP")
 
 
+# Italo numbers its trains from 6000 up (6143, 8907, 9954 all appear on its own
+# departure boards). Lower numbers identify a commercial itinerary rather than a
+# vehicle: 1050, 1051 and 1043 are sold as trains 8971, 8993 and 8920.
+MIN_TRAIN_NUMBER = 6000
+
+
 def extract_train_number(trip_id: str) -> str:
     """
-    Extracts commercial train/bus number from trip identifier.
-    e.g. 'IT::ServiceJourney:9992--1-1-2-1' -> '9992'
-         'IT::ServiceJourney:8973-1060-1-2-1' -> '8973 / 1060'
-         'IT::ServiceJourney:1004-8192-1-1-1' -> '8192'
+    Extracts the commercial train number from a trip identifier.
+
+    Source ids carry up to two numbers ('1004-8192'), one per leg of the journey
+    they belong to. Joining both, as this did before, produced trip_short_name
+    values like '8134 / 8920' that no Italo screen ever shows; the booking site
+    displays a single number per leg. Prefer the train number when one is there.
     """
     raw = trip_id.split(":")[-1]
     m = re.match(r"^(\d+)(?:-(\d+))?", raw)
-    if m:
-        p1 = m.group(1)
-        p2 = m.group(2)
-        if p2 and int(p2) > 10:
-            return p1 if p1 == p2 else f"{p1} / {p2}"
-        return p1
-    return raw
+    if not m:
+        return raw
+    parts = [p for p in (m.group(1), m.group(2)) if p and int(p) > 10]
+    trains = [p for p in parts if int(p) >= MIN_TRAIN_NUMBER]
+    return (trains or parts or [m.group(1)])[0]
 
 
 def read_netex_metadata(netex_gz: Path) -> ItaloMetadata:
@@ -289,6 +365,14 @@ def time_to_sec(t: str) -> int:
     return parts[0] * 3600 + parts[1] * 60 + parts[2]
 
 
+def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Great-circle distance between two (lat, lon) pairs, in kilometers."""
+    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
+    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
+    h = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+    return 2 * 6371.0 * math.asin(math.sqrt(h))
+
+
 def clean_station_name(name: str) -> str:
     """
     Strips trailing English annotations from station names:
@@ -350,18 +434,21 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
     if "wheelchair_boarding" not in fieldnames:
         fieldnames.append("wheelchair_boarding")
 
+    # Derived from the stop names, so read it before they are cleaned up.
+    pure_bus_stop_ids = collect_bus_stop_ids(stop_rows)
+
     for row in stop_rows:
         raw_name = row.get("stop_name", "")
-        cleaned = clean_station_name(raw_name)
+        cleaned = MISLABELLED_BUS_STOP_IDS.get(row["stop_id"]) or clean_station_name(raw_name)
         row["stop_name"] = cleaned
         stops_map[row["stop_id"]] = cleaned
-        if row["stop_id"] in PURE_BUS_STOP_IDS and row.get("parent_station"):
+        if row["stop_id"] in pure_bus_stop_ids and row.get("parent_station"):
             bus_parent_ids.add(row["parent_station"])
 
     for row in stop_rows:
         stop_id = row["stop_id"]
         loc_type = row.get("location_type", "0")
-        is_bus = stop_id in PURE_BUS_STOP_IDS or stop_id in bus_parent_ids or row.get("parent_station") in PURE_BUS_STOP_IDS
+        is_bus = stop_id in pure_bus_stop_ids or stop_id in bus_parent_ids or row.get("parent_station") in pure_bus_stop_ids
 
         # Set wheelchair accessibility: 1 for AV train stations, 0 for bus stops
         row["wheelchair_boarding"] = "0" if is_bus else "1"
@@ -403,13 +490,12 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
         # Sort chronologically by arrival or departure time
         sorted_stops = sorted(st_list, key=lambda x: x["arrival_time"] or x["departure_time"])
         orig_trip = trips_by_id[tid]
-        orig_route_id = orig_trip["route_id"]
 
-        has_bus = any(s["stop_id"] in PURE_BUS_STOP_IDS for s in sorted_stops)
-        has_rail = any(s["stop_id"] not in PURE_BUS_STOP_IDS for s in sorted_stops)
+        has_bus = any(s["stop_id"] in pure_bus_stop_ids for s in sorted_stops)
+        has_rail = any(s["stop_id"] not in pure_bus_stop_ids for s in sorted_stops)
 
-        # Pure rail trip
-        if not (has_bus and has_rail):
+        # Pure rail trip, unless it hides a train change behind a long stop
+        if not (has_bus and has_rail) and len(split_on_layovers([("RAIL", sorted_stops)])) == 1:
             total_s = len(sorted_stops)
             for seq, s in enumerate(sorted_stops, start=1):
                 s["stop_sequence"] = str(seq)
@@ -425,9 +511,10 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
                     s["drop_off_type"] = "0"
                 new_st_rows.append(s)
 
-            if orig_route_id not in new_routes:
-                new_routes[orig_route_id] = {
-                    "route_id": orig_route_id,
+            rid = build_route_id("RAIL", [s["stop_id"] for s in sorted_stops])
+            if rid not in new_routes:
+                new_routes[rid] = {
+                    "route_id": rid,
                     "agency_id": AGENCY_ID,
                     "route_short_name": "Italo",
                     "route_long_name": "Italo AV (Alta Velocità)",
@@ -443,6 +530,7 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
                 }
 
             trip_row = dict(orig_trip)
+            trip_row["route_id"] = rid
             trip_row["trip_short_name"] = metadata.train_numbers.get(tid, extract_train_number(tid))
             trip_row["trip_headsign"] = stops_map.get(sorted_stops[-1]["stop_id"], "")
             trip_row["wheelchair_accessible"] = "1"
@@ -451,7 +539,7 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
             continue
 
         # Composite trip (Train + Shuttle Bus) -> Split at junction station(s)
-        types = ["BUS" if s["stop_id"] in PURE_BUS_STOP_IDS else "RAIL" for s in sorted_stops]
+        types = ["BUS" if s["stop_id"] in pure_bus_stop_ids else "RAIL" for s in sorted_stops]
         transitions = [i for i in range(len(types) - 1) if types[i] != types[i + 1]]
 
         leg_defs: list[tuple[str, list[dict[str, str]]]] = []
@@ -475,6 +563,8 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
             # Fallback for unexpected transitions: treat as rail
             leg_defs.append(("RAIL", sorted_stops))
 
+        leg_defs = split_on_layovers(leg_defs)
+
         # Parse commercial train / bus numbers
         raw_id = tid.split(":")[-1]
         m = re.match(r"^(\d+)(?:-(\d+))?", raw_id)
@@ -483,9 +573,12 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
 
         created_legs: list[tuple[str, str, list[dict[str, str]]]] = []
         for leg_idx, (mode, leg_stops) in enumerate(leg_defs, start=1):
-            suffix = f"_{mode.lower()}" if len(leg_defs) == 2 else f"_{mode.lower()}{leg_idx}"
+            # Always number the leg: a split on a layover can yield two legs of
+            # the same mode, which an unnumbered suffix would give one trip_id.
+            same_mode = sum(1 for m, _ in leg_defs if m == mode)
+            suffix = f"_{mode.lower()}" if len(leg_defs) == 2 and same_mode == 1 else f"_{mode.lower()}{leg_idx}"
             leg_tid = f"{tid}{suffix}"
-            leg_rid = f"{orig_route_id}-{mode}"
+            leg_rid = build_route_id(mode, [s["stop_id"] for s in leg_stops])
 
             if leg_rid not in new_routes:
                 new_routes[leg_rid] = {
@@ -504,13 +597,16 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
                     "network_id": "",
                 }
 
-            if len(leg_defs) == 2:
-                if leg_defs[0][0] == "RAIL":
-                    leg_num = p1 if mode == "RAIL" else (p2 or p1)
-                else:
-                    leg_num = p1 if mode == "BUS" else (p2 or p1)
-            else:
-                leg_num = p1
+            # Pick by number range, not by position: the source orders the two
+            # numbers inconsistently ('3017-8908' but '8954-1050'), which used to
+            # give both legs the same number whenever only one was present.
+            leg_num = next(
+                (
+                    p for p in (p1, p2)
+                    if p and (int(p) >= MIN_TRAIN_NUMBER) == (mode == "RAIL")
+                ),
+                p1,
+            )
 
             leg_dest = stops_map.get(leg_stops[-1]["stop_id"], "")
 
@@ -767,7 +863,7 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
         from scripts.generate_shapes import generate_shapes
         generate_shapes(extract_dir)
     except Exception as e:
-        print(f"⚠️  Could not generate shapes: {e}")
+        print(f"Could not generate shapes: {e}")
 
     # 10. Package final GTFS zip
     if OUTPUT_ZIP.exists():
@@ -781,6 +877,50 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
 
 
 # ── Sanity Checks ─────────────────────────────────────────────────────────────
+
+def find_gtfstidy() -> str | None:
+    """Finds the gtfstidy binary in PATH or the default `go install` location."""
+    found = shutil.which("gtfstidy")
+    if found:
+        return found
+    candidate = Path.home() / "go" / "bin" / "gtfstidy"
+    return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
+
+
+def tidy_feed(gtfs_zip: Path) -> None:
+    """
+    Runs gtfstidy over the packaged feed.
+
+    The source describes commercial itineraries rather than vehicles, so one
+    train shows up once per itinerary it belongs to: train 8970 appeared 123
+    times, 96 of those days carrying two identical copies. Deduplicating trips
+    (-I) merges them by uniting their service ids, which keeps every operating
+    date. -c rewrites the date lists as weekly patterns, taking calendar_dates
+    from 35,369 rows to 110, and -S/-s drop duplicate and collinear shape points.
+
+    Skipped with a warning when gtfstidy is missing: the feed stays valid, just
+    more verbose.
+    """
+    binary = find_gtfstidy()
+    if not binary:
+        print("gtfstidy not found, skipping feed minimisation (see https://github.com/patrickbr/gtfstidy)")
+        return
+
+    tidied = gtfs_zip.with_name(gtfs_zip.stem + "_tidy.zip")
+    res = subprocess.run(
+        [binary, "-I", "-S", "-s", "-c", "-C", "--keep-ids", "-F", "-o", str(tidied), str(gtfs_zip)],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0 or not tidied.exists():
+        print(f"gtfstidy failed (code {res.returncode}), keeping untidied feed:\n{res.stderr}")
+        tidied.unlink(missing_ok=True)
+        return
+
+    before = gtfs_zip.stat().st_size
+    tidied.replace(gtfs_zip)
+    print(f"Tidied feed: {before:,} -> {gtfs_zip.stat().st_size:,} bytes")
+
 
 def sanity_check(gtfs_zip: Path) -> None:
     print(f"Running sanity checks on {gtfs_zip}...")
@@ -863,6 +1003,32 @@ def sanity_check(gtfs_zip: Path) -> None:
             if len(cal_dates) == 0:
                 sys.exit("calendar_dates.txt is unexpectedly empty")
 
+        with zf.open("routes.txt") as f:
+            routes = list(csv.DictReader(line.decode("utf-8") for line in f))
+            coach_route_ids = {row["route_id"] for row in routes if row.get("route_type") == "3"}
+
+        # A coach leg averaging more than MAX_COACH_SPEED_KMH is a train that was
+        # split at a stop wrongly treated as coach-only (see collect_bus_stop_ids).
+        coords = {row["stop_id"]: (float(row["stop_lat"]), float(row["stop_lon"])) for row in stops}
+        coach_trip_ids = {row["trip_id"] for row in trips if row["route_id"] in coach_route_ids}
+        too_fast = []
+        for tid in coach_trip_ids:
+            seq = sorted(trip_times[tid], key=lambda x: x[0])
+            if len(seq) < 2:
+                continue
+            stops_of_trip = [row for row in st if row["trip_id"] == tid]
+            stops_of_trip.sort(key=lambda r: int(r["stop_sequence"]))
+            km = sum(
+                haversine_km(coords[a["stop_id"]], coords[b["stop_id"]])
+                for a, b in zip(stops_of_trip, stops_of_trip[1:])
+            )
+            hours = (time_to_sec(seq[-1][1]) - time_to_sec(seq[0][2])) / 3600
+            if hours > 0 and km / hours > MAX_COACH_SPEED_KMH:
+                too_fast.append((tid, km / hours))
+        if too_fast:
+            worst = ", ".join(f"{tid} ({kmh:.0f} km/h)" for tid, kmh in sorted(too_fast, key=lambda x: -x[1])[:5])
+            sys.exit(f"{len(too_fast)} coach trips exceed {MAX_COACH_SPEED_KMH:.0f} km/h: {worst}")
+
         if "shapes.txt" in names:
             print(f"Shapes coverage: {len(trips_with_shapes):,} / {len(trips):,} trips ({len(trips_with_shapes)/len(trips)*100:.1f}%)")
 
@@ -893,6 +1059,7 @@ def main() -> None:
         print(f"Using existing raw GTFS zip at {gtfs_raw_zip}")
 
     post_process(gtfs_raw_zip, metadata, publication_timestamp)
+    tidy_feed(OUTPUT_ZIP)
     sanity_check(OUTPUT_ZIP)
 
     STALE_STATE_FILE.write_text(publication_timestamp)
