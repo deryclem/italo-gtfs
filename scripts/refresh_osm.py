@@ -87,7 +87,7 @@ def write_coach_only_feed(gtfs_zip: Path, out_zip: Path) -> int:
 
 
 def refresh_osm() -> None:
-    from scripts.generate_shapes import find_pfaedle
+    from generate_shapes import find_pfaedle
 
     pfaedle_bin = find_pfaedle()
 
