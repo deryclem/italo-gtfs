@@ -85,31 +85,84 @@ def build_route_id(mode: str, stop_ids: list[str]) -> str:
     digest = hashlib.sha1("|".join(stop_ids).encode("utf-8")).hexdigest()[:6]
     return f"IT::Line:{mode}-{short[0]}-{short[-1]}-{digest}"
 
-# A stop where the vehicle waits longer than this is a connection, not a dwell.
-# Italo's booking site shows "Change" for an 87 min wait at Bologna (6143/8918)
-# and nothing for the 2 min one at Verona (9908/8981), so the line sits between.
-MAX_DWELL_SECONDS = 20 * 60
+# A train change hides in the longest stop of the journey, but only when the
+# source says there is one: its id then carries two train numbers ('8134-8920').
+# A through train that merely waits at a station (8158 sits 22 min at Napoli,
+# 9992 26 min at Roma) has a single number and must stay one trip. Below this a
+# stop is dwell, not a change, even with two numbers: Italo's site shows nothing
+# for 2 min at Verona (9908/8981), and 9928-8918 stops 13 min at Mestre.
+MIN_CHANGE_DWELL_SECONDS = 20 * 60
 
 
-def split_on_layovers(leg_defs: list[tuple[str, list[dict[str, str]]]]) -> list[tuple[str, list[dict[str, str]]]]:
+def parse_trip_numbers(trip_id: str) -> list[str]:
+    """Numbers found at the head of a source id ('8134-8920--1-1-1-1' -> ['8134', '8920'])."""
+    raw = trip_id.split(":")[-1]
+    m = re.match(r"^(\d+)(?:-(\d+))?", raw)
+    if not m:
+        return []
+    return [p for p in (m.group(1), m.group(2)) if p and int(p) > 10]
+
+
+def find_published_tail(
+    stops: list[dict[str, str]], number: str, published: dict[str, list[list[dict[str, str]]]]
+) -> tuple[int, list[dict[str, str]]] | None:
     """
-    Splits a leg wherever the vehicle sits at a stop past MAX_DWELL_SECONDS.
+    Finds where a composite journey hands over to a train Italo also publishes alone.
+
+    9928-8914 has its change at Roma, but the wait sits between two stops, so no
+    stop is long. The source does publish 8914 by itself, though: when that train
+    is exactly the end of the composite (same stops, same arrivals), the data
+    itself proves where the change is, and gives the true departure time.
+    Returns the junction index and the published train, or None.
+    """
+    for candidate in published.get(number, []):
+        k = len(stops) - len(candidate)
+        if k < 1 or len(candidate) < 2 or stops[k]["stop_id"] != candidate[0]["stop_id"]:
+            continue
+        if all(
+            a["stop_id"] == b["stop_id"] and a["arrival_time"] == b["arrival_time"]
+            for a, b in zip(stops[k + 1 :], candidate[1:])
+        ):
+            return k, candidate
+    return None
+
+
+def split_on_train_change(
+    leg_defs: list[tuple[str, list[dict[str, str]]]],
+    numbers: list[str],
+    published: dict[str, list[list[dict[str, str]]]],
+) -> list[tuple[str, list[dict[str, str]]]]:
+    """
+    Splits a leg in two when the source id names two trains of that mode.
 
     The source packs a whole itinerary into one journey, so a train change shows
     up as a very long stop: Reggio Calabria to Udine waits 3h25 at Roma Termini,
-    which Italo sells as trains 8134 then 8920. Left alone it reads as one train
-    that simply parks, and riders are never told to change.
+    which Italo sells as trains 8134 then 8920. The two numbers say a change
+    exists; the longest stop says where, or failing that the second train being
+    published on its own. A long wait alone proves nothing.
     """
     out: list[tuple[str, list[dict[str, str]]]] = []
     for mode, stops_of_leg in leg_defs:
-        start = 0
-        for i, stop in enumerate(stops_of_leg[1:-1], start=1):
-            dwell = time_to_sec(stop["departure_time"]) - time_to_sec(stop["arrival_time"])
-            if dwell > MAX_DWELL_SECONDS:
-                # The junction stop ends one leg and starts the next.
-                out.append((mode, stops_of_leg[start : i + 1]))
-                start = i
-        out.append((mode, stops_of_leg[start:]))
+        of_mode = [n for n in numbers if (int(n) >= MIN_TRAIN_NUMBER) == (mode == "RAIL")]
+        if len(of_mode) < 2 or len(stops_of_leg) < 3:
+            out.append((mode, stops_of_leg))
+            continue
+        dwell, i = max(
+            (time_to_sec(s["departure_time"]) - time_to_sec(s["arrival_time"]), i)
+            for i, s in enumerate(stops_of_leg[1:-1], start=1)
+        )
+        if dwell >= MIN_CHANGE_DWELL_SECONDS:
+            # The junction stop ends one leg and starts the next.
+            out.append((mode, stops_of_leg[: i + 1]))
+            out.append((mode, stops_of_leg[i:]))
+            continue
+        tail = find_published_tail(stops_of_leg, of_mode[1], published) if mode == "RAIL" else None
+        if tail:
+            k, train = tail
+            out.append((mode, stops_of_leg[: k + 1]))
+            out.append((mode, train))
+        else:
+            out.append((mode, stops_of_leg))
     return out
 
 
@@ -251,13 +304,12 @@ def extract_train_number(trip_id: str) -> str:
     values like '8134 / 8920' that no Italo screen ever shows; the booking site
     displays a single number per leg. Prefer the train number when one is there.
     """
-    raw = trip_id.split(":")[-1]
-    m = re.match(r"^(\d+)(?:-(\d+))?", raw)
-    if not m:
-        return raw
-    parts = [p for p in (m.group(1), m.group(2)) if p and int(p) > 10]
+    parts = parse_trip_numbers(trip_id)
+    if not parts:
+        m = re.match(r"^(\d+)", trip_id.split(":")[-1])
+        return m.group(1) if m else trip_id.split(":")[-1]
     trains = [p for p in parts if int(p) >= MIN_TRAIN_NUMBER]
-    return (trains or parts or [m.group(1)])[0]
+    return (trains or parts)[0]
 
 
 def read_netex_metadata(netex_gz: Path) -> ItaloMetadata:
@@ -384,6 +436,154 @@ def clean_station_name(name: str) -> str:
     return re.sub(r"\s*\([^)]*\)$", "", name).strip()
 
 
+def _apply_replacements(
+    replaced: dict[str, str],
+    new_trips: list[dict[str, str]],
+    new_st_rows: list[dict[str, str]],
+    transfers_rows: list[dict[str, str]],
+) -> None:
+    """Drops the replaced trips and makes transfers follow the trip that stands in."""
+    if not replaced:
+        return
+    new_trips[:] = [t for t in new_trips if t["trip_id"] not in replaced]
+    new_st_rows[:] = [r for r in new_st_rows if r["trip_id"] not in replaced]
+    seen: set[tuple[str, ...]] = set()
+    kept = []
+    for tr in transfers_rows:
+        tr["from_trip_id"] = replaced.get(tr["from_trip_id"], tr["from_trip_id"])
+        tr["to_trip_id"] = replaced.get(tr["to_trip_id"], tr["to_trip_id"])
+        sig = tuple(tr.values())
+        if sig not in seen:
+            seen.add(sig)
+            kept.append(tr)
+    transfers_rows[:] = kept
+
+
+def _is_part_of(short: list[dict[str, str]], long: list[dict[str, str]]) -> bool:
+    """
+    True when `short` is the start or the end of `long`: same stops, same
+    arrivals, and the same departure from its first stop. Riders lose nothing
+    by taking `long` instead, since it calls at every stop of `short`.
+    """
+    n = len(short)
+    if n < 2 or n >= len(long):
+        return False
+
+    def same(a: list[dict[str, str]], b: list[dict[str, str]]) -> bool:
+        return (
+            a[0]["stop_id"] == b[0]["stop_id"]
+            and a[0]["departure_time"] == b[0]["departure_time"]
+            and all(x["stop_id"] == y["stop_id"] and x["arrival_time"] == y["arrival_time"] for x, y in zip(a[1:], b[1:]))
+        )
+
+    return same(short, long[:n]) or same(short, long[-n:])
+
+
+def dedupe_legs(
+    new_trips: list[dict[str, str]],
+    new_st_rows: list[dict[str, str]],
+    transfers_rows: list[dict[str, str]],
+    metadata: ItaloMetadata,
+) -> None:
+    """
+    Removes trips that repeat another one, in two passes. Works in place; with a
+    source that has no such repeats it changes nothing.
+
+    1. Same train run: same number, stops and arrival times. The source repeats
+       a train once per day type (8987 appears 28 times) and once per onward
+       connection (the Bari-Roma part of 9928 appears in 5 itineraries). The
+       survivor gets the union of their days.
+    2. Part of a longer run of the same number (9920 stopping at Milano next to
+       9920 going on to Torino). Dropped only when every day it runs is also a
+       day the longer one runs, so no service disappears.
+
+    Run after the legs are split so shared parts collapse. Transfers follow the
+    trip that stands in.
+    """
+
+    def rows_by_trip() -> dict[str, list[dict[str, str]]]:
+        rows_of: dict[str, list[dict[str, str]]] = defaultdict(list)
+        for row in new_st_rows:
+            rows_of[row["trip_id"]].append(row)
+        for rows in rows_of.values():
+            rows.sort(key=lambda r: int(r["stop_sequence"]))
+        return rows_of
+
+    # Pass 1: identical runs
+    rows_of = rows_by_trip()
+    groups: dict[tuple, list[dict[str, str]]] = {}
+    dwell: dict[str, int] = {}
+    for trip in new_trips:
+        rows = rows_of[trip["trip_id"]]
+        # Same arrivals and same first departure make the same run. Departures
+        # are left out because a copy may omit a stop's dwell: the 8960 inside
+        # 9928-8960 leaves Firenze at 13:57, the standalone 8960 at 14:05.
+        key = (
+            trip["trip_short_name"],
+            trip["route_id"],
+            tuple((r["stop_id"], r["arrival_time"]) for r in rows),
+            rows[0]["departure_time"],
+        )
+        dwell[trip["trip_id"]] = sum(time_to_sec(r["departure_time"]) - time_to_sec(r["arrival_time"]) for r in rows)
+        groups.setdefault(key, []).append(trip)
+
+    replaced: dict[str, str] = {}
+    for trips in groups.values():
+        if len(trips) < 2:
+            continue
+        keep = max(trips, key=lambda t: dwell[t["trip_id"]])  # the copy with the most detail
+        service_ids = sorted({t["service_id"] for t in trips})
+        if len(service_ids) > 1:
+            digest = hashlib.sha1("|".join(service_ids).encode("utf-8")).hexdigest()[:8]
+            merged_id = f"IT::DayType:merged-{digest}"
+            if merged_id not in metadata.calendar_dates:
+                dates: set[str] = set()
+                for sid in service_ids:
+                    dates.update(metadata.calendar_dates.get(sid, []))
+                metadata.calendar_dates[merged_id] = sorted(dates)
+                ranges = [metadata.calendar_ranges[sid] for sid in service_ids if sid in metadata.calendar_ranges]
+                if ranges:
+                    metadata.calendar_ranges[merged_id] = (min(r[0] for r in ranges), max(r[1] for r in ranges))
+            keep["service_id"] = merged_id
+        for t in trips:
+            if t is not keep:
+                replaced[t["trip_id"]] = keep["trip_id"]
+    _apply_replacements(replaced, new_trips, new_st_rows, transfers_rows)
+    merged_count = len(replaced)
+
+    # Pass 2: parts of a longer run. Longest first, so a part is only ever
+    # compared with trips that stay.
+    rows_of = rows_by_trip()
+    by_number: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for trip in new_trips:
+        if trip["trip_short_name"].isdigit() and int(trip["trip_short_name"]) >= MIN_TRAIN_NUMBER:
+            by_number[trip["trip_short_name"]].append(trip)
+
+    replaced = {}
+    for trips in by_number.values():
+        trips.sort(key=lambda t: len(rows_of[t["trip_id"]]), reverse=True)
+        stays: list[dict[str, str]] = []
+        for trip in trips:
+            days = set(metadata.calendar_dates.get(trip["service_id"], []))
+            container = next(
+                (
+                    big for big in stays
+                    if days
+                    and days <= set(metadata.calendar_dates.get(big["service_id"], []))
+                    and _is_part_of(rows_of[trip["trip_id"]], rows_of[big["trip_id"]])
+                ),
+                None,
+            )
+            if container:
+                replaced[trip["trip_id"]] = container["trip_id"]
+            else:
+                stays.append(trip)
+    _apply_replacements(replaced, new_trips, new_st_rows, transfers_rows)
+
+    if merged_count or replaced:
+        print(f"  Dropped {merged_count} identical and {len(replaced)} partial duplicate trips")
+
+
 def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timestamp: str) -> None:
     extract_dir = WORK_DIR / "gtfs_extracted"
     if extract_dir.exists():
@@ -486,6 +686,13 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
     new_routes: dict[str, dict[str, str]] = {}
     transfers_rows: list[dict[str, str]] = []
 
+    # Trains the source also publishes on their own, by number (see find_published_tail)
+    published: dict[str, list[list[dict[str, str]]]] = defaultdict(list)
+    for tid, st_list in trip_stop_times.items():
+        alone = parse_trip_numbers(tid)
+        if len(alone) == 1 and int(alone[0]) >= MIN_TRAIN_NUMBER:
+            published[alone[0]].append(sorted(st_list, key=lambda x: x["arrival_time"] or x["departure_time"]))
+
     for tid, st_list in trip_stop_times.items():
         # Sort chronologically by arrival or departure time
         sorted_stops = sorted(st_list, key=lambda x: x["arrival_time"] or x["departure_time"])
@@ -495,7 +702,8 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
         has_rail = any(s["stop_id"] not in pure_bus_stop_ids for s in sorted_stops)
 
         # Pure rail trip, unless it hides a train change behind a long stop
-        if not (has_bus and has_rail) and len(split_on_layovers([("RAIL", sorted_stops)])) == 1:
+        trip_numbers = parse_trip_numbers(tid)
+        if not (has_bus and has_rail) and len(split_on_train_change([("RAIL", sorted_stops)], trip_numbers, published)) == 1:
             total_s = len(sorted_stops)
             for seq, s in enumerate(sorted_stops, start=1):
                 s["stop_sequence"] = str(seq)
@@ -563,17 +771,20 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
             # Fallback for unexpected transitions: treat as rail
             leg_defs.append(("RAIL", sorted_stops))
 
-        leg_defs = split_on_layovers(leg_defs)
+        leg_defs = split_on_train_change(leg_defs, trip_numbers, published)
 
-        # Parse commercial train / bus numbers
-        raw_id = tid.split(":")[-1]
-        m = re.match(r"^(\d+)(?:-(\d+))?", raw_id)
-        p1 = m.group(1) if m else raw_id
-        p2 = m.group(2) if m and m.group(2) and int(m.group(2)) > 10 else None
+        # Numbers of each mode, in id order: legs of a mode take them in turn.
+        # The source orders rail and bus numbers inconsistently ('3017-8908' but
+        # '8954-1050'), so they are told apart by range, not by position.
+        numbers_of = {
+            mode: [n for n in trip_numbers if (int(n) >= MIN_TRAIN_NUMBER) == (mode == "RAIL")]
+            for mode in ("RAIL", "BUS")
+        }
+        legs_seen: dict[str, int] = defaultdict(int)
 
         created_legs: list[tuple[str, str, list[dict[str, str]]]] = []
         for leg_idx, (mode, leg_stops) in enumerate(leg_defs, start=1):
-            # Always number the leg: a split on a layover can yield two legs of
+            # Always number the leg: a split on a train change can yield two legs of
             # the same mode, which an unnumbered suffix would give one trip_id.
             same_mode = sum(1 for m, _ in leg_defs if m == mode)
             suffix = f"_{mode.lower()}" if len(leg_defs) == 2 and same_mode == 1 else f"_{mode.lower()}{leg_idx}"
@@ -597,16 +808,10 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
                     "network_id": "",
                 }
 
-            # Pick by number range, not by position: the source orders the two
-            # numbers inconsistently ('3017-8908' but '8954-1050'), which used to
-            # give both legs the same number whenever only one was present.
-            leg_num = next(
-                (
-                    p for p in (p1, p2)
-                    if p and (int(p) >= MIN_TRAIN_NUMBER) == (mode == "RAIL")
-                ),
-                p1,
-            )
+            # 8134-8920 is two trains: its second rail leg is 8920, not 8134 again.
+            pool = numbers_of[mode] or trip_numbers or [tid.split(":")[-1]]
+            leg_num = pool[min(legs_seen[mode], len(pool) - 1)]
+            legs_seen[mode] += 1
 
             leg_dest = stops_map.get(leg_stops[-1]["stop_id"], "")
 
@@ -665,6 +870,8 @@ def post_process(gtfs_raw_zip: Path, metadata: ItaloMetadata, publication_timest
                 "transfer_type": "2",
                 "min_transfer_time": str(layover),
             })
+
+    dedupe_legs(new_trips, new_st_rows, transfers_rows, metadata)
 
     # Station-level walking transfers for major junction hubs
     for hub in JUNCTION_HUBS:
